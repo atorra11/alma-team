@@ -1,3 +1,5 @@
+from heapq import heapify, heappop, heappush
+
 from contest.capture_agents import CaptureAgent
 from contest.game import Directions
 from contest.util import nearest_point
@@ -25,6 +27,13 @@ class AlmaAgent(CaptureAgent):
         if not self.gates:
             self.gates = [state.get_agent_position(self.index)]
         self.patrol_index = len(self.gates) // 2
+        self.neighbors = {}
+        for x in range(1, walls.width - 1):
+            for y in range(1, walls.height - 1):
+                if not walls[x][y]:
+                    self.neighbors[x, y] = [(nx, ny) for nx, ny in
+                                            ((x-1, y), (x+1, y), (x, y-1), (x, y+1))
+                                            if not walls[nx][ny]]
         self.food_exit_distance = {pellet: self.distance(pellet, self.gates)
                                    for pellet in self.get_food(state).as_list()}
 
@@ -42,6 +51,29 @@ class AlmaAgent(CaptureAgent):
             return self.defend(state, actions, own, visible)
         return self.attack(state, actions, own, position, visible)
 
+    def safe_routes(self, goals, ghosts, capsules):
+        # Cerca de cost uniforme des dels objectius, penalitzant el perill.
+        danger = {}
+        for position in self.neighbors:
+            distance = self.distance(position, ghosts)
+            danger[position] = {0: 70, 1: 28, 2: 9, 3: 3, 4: 1}.get(distance, 0)
+        for capsule in capsules:
+            danger[capsule] = 0
+        costs = dict(goals)
+        queue = [(cost, position) for position, cost in goals]
+        # Tots els objectius entren a la mateixa cua de prioritat.
+        heapify(queue)
+        while queue:
+            cost, position = heappop(queue)
+            if cost != costs[position]:
+                continue
+            for neighbor in self.neighbors[position]:
+                next_cost = cost + 1 + danger[position]
+                if next_cost < costs.get(neighbor, float("inf")):
+                    costs[neighbor] = next_cost
+                    heappush(queue, (next_cost, neighbor))
+        return costs
+
     def attack(self, state, actions, own, position, visible):
         food = self.get_food(state).as_list()
         capsules = self.get_capsules(state)
@@ -55,6 +87,16 @@ class AlmaAgent(CaptureAgent):
             or state.data.timeleft <= 4 * (home_distance + 3)
         )
 
+        routes = None
+        if ghosts and self.distance(position, ghosts) <= 7:
+            goals = [(gate, 0) for gate in self.gates] if retreat else [
+                (pellet, 0.20 * self.food_exit_distance.get(pellet, 0)) for pellet in food
+            ]
+            if not retreat:
+                goals += [(capsule, 0) for capsule in capsules]
+            if goals:
+                routes = self.safe_routes(goals, ghosts, capsules)
+
         def value(action):
             successor = state.generate_successor(self.index, action)
             future = successor.get_agent_state(self.index)
@@ -62,7 +104,11 @@ class AlmaAgent(CaptureAgent):
             score = 24 * (future.num_returned - own.num_returned)
             if own.is_pacman and not future.is_pacman and future.num_returned == own.num_returned:
                 score -= 100 + 12 * own.num_carrying
-            if retreat:
+            if routes is not None:
+                score -= (2 if retreat else 1) * routes.get(nearest_point(pos), 1000)
+                if not retreat:
+                    score += 4 * (future.num_carrying - own.num_carrying)
+            elif retreat:
                 score -= 3 * self.distance(pos, self.gates)
             elif food:
                 # Valorem menjar proper amb un camí curt de retorn.
@@ -104,6 +150,12 @@ class AlmaAgent(CaptureAgent):
             future = successor.get_agent_state(self.index)
             pos = nearest_point(future.get_position())
             score = -100 * future.is_pacman
+            # Recompensem interceptar abans que l'invasor torni a casa.
+            if invaders and own.scared_timer <= 1:
+                remaining = sum(successor.get_agent_state(i).is_pacman
+                                for i in self.get_opponents(state))
+                score += 60 * (sum(state.get_agent_state(i).is_pacman
+                                   for i in self.get_opponents(state)) - remaining)
             if invaders:
                 distance = self.distance(pos, invaders)
                 score -= 3 * (abs(distance - 3) if own.scared_timer > 1 else distance)
